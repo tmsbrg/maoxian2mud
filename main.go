@@ -8,38 +8,85 @@ import (
 	"github.com/coder/websocket"
 )
 
+type Direction string
+
+const (
+	North Direction = "north"
+	East  Direction = "east"
+	South Direction = "south"
+	West  Direction = "west"
+	Up    Direction = "up"
+	Down  Direction = "down"
+)
+
+var (
+	allDirections = []Direction{North, East, South, West, Up, Down}
+	opposite      = map[Direction]Direction{
+		North: South,
+		South: North,
+		East:  West,
+		West:  East,
+		Up:    Down,
+		Down:  Up,
+	}
+)
+
 type Command struct {
 	Player *Player
 	Text   string
 }
 
+type Room struct {
+	Name        string
+	Description string
+	Exits       map[Direction]*Room
+}
+
 type Player struct {
 	Name string
+	Room *Room
 	Send chan string
 }
 
 type World struct {
-	Join    chan *Player
-	Leave   chan *Player
-	Command chan Command
-
-	Players map[*Player]bool
+	Join      chan *Player
+	Leave     chan *Player
+	Command   chan Command
+	Players   map[*Player]bool
+	StartRoom *Room
 }
 
 func NewWorld() *World {
+	palace := &Room{
+		Name:        "Palace",
+		Description: "You are in a grand palace.",
+		Exits:       make(map[Direction]*Room),
+	}
+	square := &Room{
+		Name:        "Town Square",
+		Description: "You are in the bustling town square.",
+		Exits:       make(map[Direction]*Room),
+	}
+
+	palace.Exits[South] = square
+	square.Exits[North] = palace
+
 	return &World{
-		Join:    make(chan *Player),
-		Leave:   make(chan *Player),
-		Command: make(chan Command),
-		Players: make(map[*Player]bool),
+		Join:      make(chan *Player),
+		Leave:     make(chan *Player),
+		Command:   make(chan Command),
+		Players:   make(map[*Player]bool),
+		StartRoom: palace,
 	}
 }
 
-func (w *World) Broadcast(msg string) {
+func (w *World) broadcastToRoom(room *Room, msg string, except *Player) {
 	for p := range w.Players {
-		select {
-		case p.Send <- msg:
-		default:
+		if p.Room == room && p != except {
+			select {
+			case p.Send <- msg:
+			default:
+			}
 		}
 	}
 }
@@ -49,19 +96,75 @@ func (w *World) Run() {
 		select {
 		case p := <-w.Join:
 			w.Players[p] = true
+			p.Room = w.StartRoom
 			p.Send <- "Welcome to MaoXianMUD!"
 			p.Send <- "Type 'help'"
-			w.Broadcast("*** " + p.Name + " entered the world")
+			p.Send <- w.describeRoom(p)
+			w.broadcastToRoom(p.Room, "*** "+p.Name+" enters.", p)
 
 		case p := <-w.Leave:
+			if p.Room != nil {
+				w.broadcastToRoom(p.Room, "*** "+p.Name+" leaves.", p)
+			}
 			delete(w.Players, p)
 			close(p.Send)
-			w.Broadcast("*** " + p.Name + " left the world")
 
 		case cmd := <-w.Command:
 			w.handleCommand(cmd)
 		}
 	}
+}
+
+func (w *World) describeRoom(p *Player) string {
+	room := p.Room
+	var b strings.Builder
+
+	b.WriteString(room.Name)
+	b.WriteString("\n")
+	b.WriteString(room.Description)
+	b.WriteString("\n\nExits:\n")
+
+	hasExits := false
+	for _, dir := range allDirections {
+		if _, ok := room.Exits[dir]; ok {
+			b.WriteString("  ")
+			b.WriteString(string(dir))
+			b.WriteString("\n")
+			hasExits = true
+		}
+	}
+	if !hasExits {
+		b.WriteString("  none\n")
+	}
+
+	b.WriteString("\nPlayers:\n")
+	hasPlayers := false
+	for other := range w.Players {
+		if other.Room == room {
+			b.WriteString(" - ")
+			b.WriteString(other.Name)
+			b.WriteString("\n")
+			hasPlayers = true
+		}
+	}
+	if !hasPlayers {
+		b.WriteString("  none\n")
+	}
+
+	return b.String()
+}
+
+func (w *World) movePlayer(p *Player, dir Direction) {
+	dest, ok := p.Room.Exits[dir]
+	if !ok {
+		p.Send <- "You can't go that way."
+		return
+	}
+
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" leaves "+string(dir)+".", p)
+	p.Room = dest
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" enters from the "+string(opposite[dir])+".", p)
+	p.Send <- w.describeRoom(p)
 }
 
 func (w *World) handleCommand(cmd Command) {
@@ -81,20 +184,11 @@ Commands:
 help
 look
 say <message>
+north, east, south, west, up, down
 `
 
 	case "look":
-		cmd.Player.Send <- `
-You are standing in an empty room.
-
-Exits:
-  none
-
-Players:
-`
-		for p := range w.Players {
-			cmd.Player.Send <- " - " + p.Name
-		}
+		cmd.Player.Send <- w.describeRoom(cmd.Player)
 
 	case "say":
 		if len(parts) < 2 {
@@ -102,11 +196,25 @@ Players:
 			return
 		}
 
-		w.Broadcast(cmd.Player.Name + ": " + parts[1])
+		w.broadcastToRoom(cmd.Player.Room, cmd.Player.Name+": "+parts[1], nil)
 
 	default:
+		if dir, ok := parseDirection(parts[0]); ok {
+			w.movePlayer(cmd.Player, dir)
+			return
+		}
 		cmd.Player.Send <- "Unknown command"
 	}
+}
+
+func parseDirection(word string) (Direction, bool) {
+	dir := Direction(strings.ToLower(word))
+	for _, d := range allDirections {
+		if dir == d {
+			return d, true
+		}
+	}
+	return "", false
 }
 
 func playerName(raw string) string {
