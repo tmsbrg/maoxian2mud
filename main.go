@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -40,12 +41,18 @@ type Room struct {
 	Name        string
 	Description string
 	Exits       map[Direction]*Room
+	Items       []*Item
+}
+
+type Item struct {
+	Name string
 }
 
 type Player struct {
-	Name string
-	Room *Room
-	Send chan string
+	Name      string
+	Room      *Room
+	Inventory []*Item
+	Send      chan string
 }
 
 type World struct {
@@ -61,11 +68,17 @@ func NewWorld() *World {
 		Name:        "Palace",
 		Description: "You are in a grand palace.",
 		Exits:       make(map[Direction]*Room),
+		Items: []*Item{
+			{Name: "golden scepter"},
+		},
 	}
 	square := &Room{
 		Name:        "Town Square",
 		Description: "You are in the bustling town square.",
 		Exits:       make(map[Direction]*Room),
+		Items: []*Item{
+			{Name: "market flyer"},
+		},
 	}
 
 	palace.Exits[South] = square
@@ -97,6 +110,7 @@ func (w *World) Run() {
 		case p := <-w.Join:
 			w.Players[p] = true
 			p.Room = w.StartRoom
+			p.Inventory = nil
 			p.Send <- "Welcome to MaoXianMUD!"
 			p.Send <- "Type 'help'"
 			p.Send <- w.describeRoom(p)
@@ -137,6 +151,17 @@ func (w *World) describeRoom(p *Player) string {
 		b.WriteString("  none\n")
 	}
 
+	b.WriteString("\nItems:\n")
+	if len(room.Items) == 0 {
+		b.WriteString("  none\n")
+	} else {
+		for _, item := range room.Items {
+			b.WriteString("  ")
+			b.WriteString(item.Name)
+			b.WriteString("\n")
+		}
+	}
+
 	b.WriteString("\nPlayers:\n")
 	hasPlayers := false
 	for other := range w.Players {
@@ -144,6 +169,11 @@ func (w *World) describeRoom(p *Player) string {
 			b.WriteString(" - ")
 			b.WriteString(other.Name)
 			b.WriteString("\n")
+			for _, item := range other.Inventory {
+				b.WriteString("     ")
+				b.WriteString(item.Name)
+				b.WriteString("\n")
+			}
 			hasPlayers = true
 		}
 	}
@@ -183,12 +213,32 @@ func (w *World) handleCommand(cmd Command) {
 Commands:
 help
 look
+inv
+take <item>
+drop <item>
 say <message>
 north, east, south, west, up, down
 `
 
 	case "look":
 		cmd.Player.Send <- w.describeRoom(cmd.Player)
+
+	case "inv":
+		cmd.Player.Send <- w.describeInventory(cmd.Player)
+
+	case "take":
+		if len(parts) < 2 {
+			cmd.Player.Send <- "Usage: take <item>"
+			return
+		}
+		w.takeItem(cmd.Player, parts[1])
+
+	case "drop":
+		if len(parts) < 2 {
+			cmd.Player.Send <- "Usage: drop <item>"
+			return
+		}
+		w.dropItem(cmd.Player, parts[1])
 
 	case "say":
 		if len(parts) < 2 {
@@ -215,6 +265,90 @@ func parseDirection(word string) (Direction, bool) {
 		}
 	}
 	return "", false
+}
+
+func (w *World) describeInventory(p *Player) string {
+	if len(p.Inventory) == 0 {
+		return "You aren't carrying anything."
+	}
+
+	var b strings.Builder
+	b.WriteString("You are carrying:\n")
+	for _, item := range p.Inventory {
+		b.WriteString("  ")
+		b.WriteString(item.Name)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+func (w *World) takeItem(p *Player, query string) {
+	item, idx, err := findItem(p.Room.Items, query)
+	if err == errItemNotFound {
+		p.Send <- "You don't see that here."
+		return
+	}
+	if err == errItemAmbiguous {
+		p.Send <- "Which one?"
+		return
+	}
+
+	p.Room.Items = removeItemAt(p.Room.Items, idx)
+	p.Inventory = append(p.Inventory, item)
+	p.Send <- "You take the " + item.Name + "."
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" takes the "+item.Name+".", p)
+}
+
+func (w *World) dropItem(p *Player, query string) {
+	item, idx, err := findItem(p.Inventory, query)
+	if err == errItemNotFound {
+		p.Send <- "You aren't carrying that."
+		return
+	}
+	if err == errItemAmbiguous {
+		p.Send <- "Which one?"
+		return
+	}
+
+	p.Inventory = removeItemAt(p.Inventory, idx)
+	p.Room.Items = append(p.Room.Items, item)
+	p.Send <- "You drop the " + item.Name + "."
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" drops the "+item.Name+".", p)
+}
+
+var (
+	errItemNotFound  = errors.New("item not found")
+	errItemAmbiguous = errors.New("item ambiguous")
+)
+
+func findItem(items []*Item, query string) (*Item, int, error) {
+	query = strings.ToLower(strings.TrimSpace(query))
+
+	var match *Item
+	var matchIdx int
+	matches := 0
+
+	for i, item := range items {
+		name := strings.ToLower(item.Name)
+		if name == query || strings.Contains(name, query) {
+			matches++
+			match = item
+			matchIdx = i
+		}
+	}
+
+	switch matches {
+	case 0:
+		return nil, -1, errItemNotFound
+	case 1:
+		return match, matchIdx, nil
+	default:
+		return nil, -1, errItemAmbiguous
+	}
+}
+
+func removeItemAt(items []*Item, i int) []*Item {
+	return append(items[:i], items[i+1:]...)
 }
 
 func playerName(raw string) string {
