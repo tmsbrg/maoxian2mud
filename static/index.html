@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MaoXianMUD</title>
+
+<style>
+body {
+    background: black;
+    color: #00ff00;
+    font-family: monospace;
+    margin: 0;
+}
+
+#output {
+    height: 90vh;
+    overflow-y: auto;
+    padding: 10px;
+    white-space: pre-wrap;
+}
+
+#input {
+    width: 100%;
+    box-sizing: border-box;
+    background: black;
+    color: #00ff00;
+    border: none;
+    padding: 10px;
+    font-family: monospace;
+}
+</style>
+</head>
+
+<body>
+
+<div id="output"></div>
+
+<input
+    id="input"
+    autocomplete="off"
+    placeholder="Type command and press Enter"
+/>
+
+<script>
+const output = document.getElementById("output");
+const input = document.getElementById("input");
+
+const ws = new WebSocket(
+    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`
+);
+
+function print(text) {
+    output.textContent += text + "\n";
+    output.scrollTop = output.scrollHeight;
+}
+
+ws.onmessage = (event) => {
+    print(event.data);
+};
+
+input.addEventListener("keydown", (e) => {
+
+    if (e.key !== "Enter") {
+        return;
+    }
+
+    const cmd = input.value;
+
+    print("> " + cmd);
+
+    ws.send(cmd);
+
+    input.value = "";
+});
+</script>
+
+</body>
+</html>
