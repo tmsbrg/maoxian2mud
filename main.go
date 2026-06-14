@@ -73,7 +73,7 @@ func (w *World) handleCommand(cmd Command) {
 
 	parts := strings.SplitN(line, " ", 2)
 
-	switch parts[0] {
+	switch strings.ToLower(parts[0]) {
 
 	case "help":
 		cmd.Player.Send <- `
@@ -109,6 +109,17 @@ Players:
 	}
 }
 
+func playerName(raw string) string {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "guest"
+	}
+	if len(name) > 32 {
+		name = name[:32]
+	}
+	return name
+}
+
 func main() {
 	world := NewWorld()
 	go world.Run()
@@ -123,7 +134,7 @@ func main() {
 		}
 
 		player := &Player{
-			Name: "guest",
+			Name: playerName(r.URL.Query().Get("name")),
 			Send: make(chan string, 32),
 		}
 
