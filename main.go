@@ -208,18 +208,18 @@ func (w *World) handleCommand(cmd Command) {
 		return
 	}
 
-	if remaining := actionCooldown - time.Since(cmd.Player.LastAction); remaining > 0 {
-		sendCooldown(cmd.Player, remaining)
-		cmd.Player.Send <- fmt.Sprintf("You need to wait %.1f seconds.", remaining.Seconds())
-		return
+	parts := strings.SplitN(line, " ", 2)
+	verb := strings.ToLower(parts[0])
+
+	if !isInfoCommand(verb) {
+		if remaining := actionCooldown - time.Since(cmd.Player.LastAction); remaining > 0 {
+			sendCooldown(cmd.Player, remaining)
+			cmd.Player.Send <- fmt.Sprintf("You need to wait %.1f seconds.", remaining.Seconds())
+			return
+		}
 	}
 
-	cmd.Player.LastAction = time.Now()
-	sendCooldown(cmd.Player, actionCooldown)
-
-	parts := strings.SplitN(line, " ", 2)
-
-	switch strings.ToLower(parts[0]) {
+	switch verb {
 
 	case "help":
 		cmd.Player.Send <- `
@@ -245,6 +245,7 @@ north, east, south, west, up, down
 			return
 		}
 		w.takeItem(cmd.Player, parts[1])
+		applyActionCooldown(cmd.Player)
 
 	case "drop":
 		if len(parts) < 2 {
@@ -252,6 +253,7 @@ north, east, south, west, up, down
 			return
 		}
 		w.dropItem(cmd.Player, parts[1])
+		applyActionCooldown(cmd.Player)
 
 	case "say":
 		if len(parts) < 2 {
@@ -260,10 +262,12 @@ north, east, south, west, up, down
 		}
 
 		w.broadcastToRoom(cmd.Player.Room, cmd.Player.Name+": "+parts[1], nil)
+		applyActionCooldown(cmd.Player)
 
 	default:
 		if dir, ok := parseDirection(parts[0]); ok {
 			w.movePlayer(cmd.Player, dir)
+			applyActionCooldown(cmd.Player)
 			return
 		}
 		cmd.Player.Send <- "Unknown command"
@@ -278,6 +282,15 @@ func parseDirection(word string) (Direction, bool) {
 		}
 	}
 	return "", false
+}
+
+func isInfoCommand(word string) bool {
+	switch word {
+	case "help", "look", "inv":
+		return true
+	default:
+		return false
+	}
 }
 
 func (w *World) describeInventory(p *Player) string {
@@ -370,6 +383,11 @@ func sendCooldown(p *Player, d time.Duration) {
 		ms = 0
 	}
 	p.Send <- fmt.Sprintf("@@cooldown:%d", ms)
+}
+
+func applyActionCooldown(p *Player) {
+	p.LastAction = time.Now()
+	sendCooldown(p, actionCooldown)
 }
 
 func playerName(raw string) string {
