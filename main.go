@@ -244,16 +244,18 @@ north, east, south, west, up, down
 			cmd.Player.Send <- "Usage: take <item>"
 			return
 		}
-		w.takeItem(cmd.Player, parts[1])
-		applyActionCooldown(cmd.Player)
+		if w.takeItem(cmd.Player, parts[1]) {
+			applyActionCooldown(cmd.Player)
+		}
 
 	case "drop":
 		if len(parts) < 2 {
 			cmd.Player.Send <- "Usage: drop <item>"
 			return
 		}
-		w.dropItem(cmd.Player, parts[1])
-		applyActionCooldown(cmd.Player)
+		if w.dropItem(cmd.Player, parts[1]) {
+			applyActionCooldown(cmd.Player)
+		}
 
 	case "say":
 		if len(parts) < 2 {
@@ -308,38 +310,40 @@ func (w *World) describeInventory(p *Player) string {
 	return b.String()
 }
 
-func (w *World) takeItem(p *Player, query string) {
+func (w *World) takeItem(p *Player, query string) bool {
 	item, idx, err := findItem(p.Room.Items, query)
 	if err == errItemNotFound {
 		p.Send <- "You don't see that here."
-		return
+		return false
 	}
 	if err == errItemAmbiguous {
 		p.Send <- "Which one?"
-		return
+		return false
 	}
 
 	p.Room.Items = removeItemAt(p.Room.Items, idx)
 	p.Inventory = append(p.Inventory, item)
 	p.Send <- "You take the " + item.Name + "."
 	w.broadcastToRoom(p.Room, "*** "+p.Name+" takes the "+item.Name+".", p)
+	return true
 }
 
-func (w *World) dropItem(p *Player, query string) {
+func (w *World) dropItem(p *Player, query string) bool {
 	item, idx, err := findItem(p.Inventory, query)
 	if err == errItemNotFound {
 		p.Send <- "You aren't carrying that."
-		return
+		return false
 	}
 	if err == errItemAmbiguous {
 		p.Send <- "Which one?"
-		return
+		return false
 	}
 
 	p.Inventory = removeItemAt(p.Inventory, idx)
 	p.Room.Items = append(p.Room.Items, item)
 	p.Send <- "You drop the " + item.Name + "."
 	w.broadcastToRoom(p.Room, "*** "+p.Name+" drops the "+item.Name+".", p)
+	return true
 }
 
 var (

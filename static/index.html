@@ -103,11 +103,6 @@ body {
 #input::placeholder {
     color: #008800;
 }
-
-#input:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
 </style>
 </head>
 
@@ -155,7 +150,6 @@ function print(text) {
 
 function startCooldown(ms) {
     cooldownEnd = Date.now() + ms;
-    input.disabled = true;
     cooldown.classList.add("active");
     updateCooldownRing();
 }
@@ -165,7 +159,6 @@ function updateCooldownRing() {
 
     if (remaining <= 0) {
         cooldownEnd = 0;
-        input.disabled = false;
         cooldown.classList.remove("active");
         cooldownFg.style.strokeDashoffset = "0";
         cooldownFrame = null;
@@ -194,18 +187,23 @@ ws.onmessage = (event) => {
     print(data);
 };
 
+function isInfoCommand(cmd) {
+    const verb = cmd.split(/\s+/)[0].toLowerCase();
+    return verb === "help" || verb === "look" || verb === "inv";
+}
+
 input.addEventListener("keydown", (e) => {
 
     if (e.key !== "Enter") {
         return;
     }
 
-    if (Date.now() < cooldownEnd) {
+    const cmd = input.value.trim();
+    if (!cmd) {
         return;
     }
 
-    const cmd = input.value.trim();
-    if (!cmd) {
+    if (Date.now() < cooldownEnd && !isInfoCommand(cmd)) {
         return;
     }
 
