@@ -41,22 +41,41 @@ type Command struct {
 }
 
 type Room struct {
-	Name        string
-	Description string
-	Exits       map[Direction]*Room
-	Items       []*Item
+	Name          string
+	Description   string
+	Exits         map[Direction]*Room
+	Items         []*Item
+	HasWeaponRack bool
 }
+
+type ItemKind string
+
+const (
+	ItemGeneric ItemKind = ""
+	ItemWeapon  ItemKind = "weapon"
+)
 
 type Item struct {
 	Name string
+	Kind ItemKind
 }
 
+type Hand string
+
+const (
+	HandRight Hand = "right"
+	HandLeft  Hand = "left"
+)
+
 type Player struct {
-	Name       string
-	Room       *Room
-	Inventory  []*Item
-	LastAction time.Time
-	Send       chan string
+	Name          string
+	Room          *Room
+	Inventory     []*Item
+	RightHand     *Item
+	LeftHand      *Item
+	TookRackSword bool
+	LastAction    time.Time
+	Send          chan string
 }
 
 type World struct {
@@ -69,9 +88,10 @@ type World struct {
 
 func NewWorld() *World {
 	palace := &Room{
-		Name:        "Palace",
-		Description: "You are in a grand palace.",
-		Exits:       make(map[Direction]*Room),
+		Name:          "Palace",
+		Description:   "You are in a grand palace. A weapon rack stands against the wall.",
+		Exits:         make(map[Direction]*Room),
+		HasWeaponRack: true,
 		Items: []*Item{
 			{Name: "golden scepter"},
 		},
@@ -115,6 +135,9 @@ func (w *World) Run() {
 			w.Players[p] = true
 			p.Room = w.StartRoom
 			p.Inventory = nil
+			p.RightHand = nil
+			p.LeftHand = nil
+			p.TookRackSword = false
 			p.Send <- "Welcome to MaoXianMUD!"
 			p.Send <- "Type 'help'"
 			p.Send <- w.describeRoom(p)
@@ -156,14 +179,19 @@ func (w *World) describeRoom(p *Player) string {
 	}
 
 	b.WriteString("\nItems:\n")
-	if len(room.Items) == 0 {
+	hasItems := false
+	if room.HasWeaponRack {
+		b.WriteString("  weapon rack\n")
+		hasItems = true
+	}
+	for _, item := range room.Items {
+		b.WriteString("  ")
+		b.WriteString(item.Name)
+		b.WriteString("\n")
+		hasItems = true
+	}
+	if !hasItems {
 		b.WriteString("  none\n")
-	} else {
-		for _, item := range room.Items {
-			b.WriteString("  ")
-			b.WriteString(item.Name)
-			b.WriteString("\n")
-		}
 	}
 
 	b.WriteString("\nPlayers:\n")
@@ -173,6 +201,8 @@ func (w *World) describeRoom(p *Player) string {
 			b.WriteString(" - ")
 			b.WriteString(other.Name)
 			b.WriteString("\n")
+			writeHandItem(&b, other.RightHand, HandRight)
+			writeHandItem(&b, other.LeftHand, HandLeft)
 			for _, item := range other.Inventory {
 				b.WriteString("     ")
 				b.WriteString(item.Name)
@@ -229,6 +259,8 @@ look
 inv
 take <item>
 drop <item>
+equip <item> [left|right]
+unequip <item|left|right>
 say <message>
 north, east, south, west, up, down
 `
@@ -254,6 +286,24 @@ north, east, south, west, up, down
 			return
 		}
 		if w.dropItem(cmd.Player, parts[1]) {
+			applyActionCooldown(cmd.Player)
+		}
+
+	case "equip":
+		if len(parts) < 2 {
+			cmd.Player.Send <- "Usage: equip <item> [left|right]"
+			return
+		}
+		if w.equipItem(cmd.Player, parts[1]) {
+			applyActionCooldown(cmd.Player)
+		}
+
+	case "unequip":
+		if len(parts) < 2 {
+			cmd.Player.Send <- "Usage: unequip <item|left|right>"
+			return
+		}
+		if w.unequipItem(cmd.Player, parts[1]) {
 			applyActionCooldown(cmd.Player)
 		}
 
@@ -296,12 +346,18 @@ func isInfoCommand(word string) bool {
 }
 
 func (w *World) describeInventory(p *Player) string {
+	var b strings.Builder
+
+	b.WriteString("Wielding:\n")
+	writeHandLine(&b, p.RightHand, HandRight)
+	writeHandLine(&b, p.LeftHand, HandLeft)
+
 	if len(p.Inventory) == 0 {
-		return "You aren't carrying anything."
+		b.WriteString("\nYou aren't carrying anything.")
+		return b.String()
 	}
 
-	var b strings.Builder
-	b.WriteString("You are carrying:\n")
+	b.WriteString("\nYou are carrying:\n")
 	for _, item := range p.Inventory {
 		b.WriteString("  ")
 		b.WriteString(item.Name)
@@ -310,9 +366,44 @@ func (w *World) describeInventory(p *Player) string {
 	return b.String()
 }
 
+func writeHandItem(b *strings.Builder, item *Item, hand Hand) {
+	if item == nil {
+		return
+	}
+	b.WriteString("     ")
+	b.WriteString(item.Name)
+	b.WriteString(" (")
+	b.WriteString(string(hand))
+	b.WriteString(" hand)\n")
+}
+
+func writeHandLine(b *strings.Builder, item *Item, hand Hand) {
+	b.WriteString("  ")
+	b.WriteString(string(hand))
+	b.WriteString(" hand: ")
+	if item == nil {
+		b.WriteString("empty")
+	} else {
+		b.WriteString(item.Name)
+	}
+	b.WriteString("\n")
+}
+
+func newSword() *Item {
+	return &Item{Name: "sword", Kind: ItemWeapon}
+}
+
 func (w *World) takeItem(p *Player, query string) bool {
+	lower := strings.ToLower(strings.TrimSpace(query))
+	if lower == "sword from rack" || lower == "sword rack" {
+		return w.takeSwordFromRack(p)
+	}
+
 	item, idx, err := findItem(p.Room.Items, query)
 	if err == errItemNotFound {
+		if isSwordQuery(lower) && p.Room.HasWeaponRack && !roomHasSword(p.Room) {
+			return w.takeSwordFromRack(p)
+		}
 		p.Send <- "You don't see that here."
 		return false
 	}
@@ -322,13 +413,44 @@ func (w *World) takeItem(p *Player, query string) bool {
 	}
 
 	p.Room.Items = removeItemAt(p.Room.Items, idx)
-	p.Inventory = append(p.Inventory, item)
-	p.Send <- "You take the " + item.Name + "."
+	w.giveTakenItem(p, item)
 	w.broadcastToRoom(p.Room, "*** "+p.Name+" takes the "+item.Name+".", p)
 	return true
 }
 
+func (w *World) takeSwordFromRack(p *Player) bool {
+	if !p.Room.HasWeaponRack {
+		p.Send <- "There is no weapon rack here."
+		return false
+	}
+	if p.TookRackSword {
+		p.Send <- "You have already taken a sword from the rack."
+		return false
+	}
+
+	p.TookRackSword = true
+	sword := newSword()
+	w.giveTakenItem(p, sword)
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" takes a sword from the rack.", p)
+	return true
+}
+
+func (w *World) giveTakenItem(p *Player, item *Item) {
+	if item.Kind == ItemWeapon && p.RightHand == nil {
+		p.RightHand = item
+		p.Send <- "You take the " + item.Name + " and equip it in your right hand."
+		return
+	}
+
+	p.Inventory = append(p.Inventory, item)
+	p.Send <- "You take the " + item.Name + "."
+}
+
 func (w *World) dropItem(p *Player, query string) bool {
+	if item, hand, ok := findEquippedItem(p, query); ok {
+		return w.dropFromHand(p, hand, item)
+	}
+
 	item, idx, err := findItem(p.Inventory, query)
 	if err == errItemNotFound {
 		p.Send <- "You aren't carrying that."
@@ -344,6 +466,199 @@ func (w *World) dropItem(p *Player, query string) bool {
 	p.Send <- "You drop the " + item.Name + "."
 	w.broadcastToRoom(p.Room, "*** "+p.Name+" drops the "+item.Name+".", p)
 	return true
+}
+
+func (w *World) dropFromHand(p *Player, hand Hand, item *Item) bool {
+	clearHand(p, hand)
+	p.Room.Items = append(p.Room.Items, item)
+	p.Send <- "You drop the " + item.Name + "."
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" drops the "+item.Name+".", p)
+	return true
+}
+
+func (w *World) equipItem(p *Player, query string) bool {
+	args := strings.Fields(strings.TrimSpace(query))
+	if len(args) == 0 {
+		p.Send <- "Usage: equip <item> [left|right]"
+		return false
+	}
+
+	itemName := args[0]
+	preferredHand := Hand("")
+	if len(args) >= 2 {
+		hand, ok := parseHand(args[1])
+		if !ok {
+			p.Send <- "Usage: equip <item> [left|right]"
+			return false
+		}
+		preferredHand = hand
+	}
+
+	item, idx, err := findItem(p.Inventory, itemName)
+	if err == errItemNotFound {
+		p.Send <- "You aren't carrying that."
+		return false
+	}
+	if err == errItemAmbiguous {
+		p.Send <- "Which one?"
+		return false
+	}
+
+	targetHand := preferredHand
+	if targetHand == "" {
+		switch {
+		case p.RightHand == nil:
+			targetHand = HandRight
+		case p.LeftHand == nil:
+			targetHand = HandLeft
+		default:
+			p.Send <- "Both hands are full."
+			return false
+		}
+	}
+
+	if handItem(p, targetHand) != nil {
+		p.Send <- "Your " + string(targetHand) + " hand is already full."
+		return false
+	}
+
+	p.Inventory = removeItemAt(p.Inventory, idx)
+	setHand(p, targetHand, item)
+	p.Send <- "You equip the " + item.Name + " in your " + string(targetHand) + " hand."
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" equips a "+item.Name+".", p)
+	return true
+}
+
+func (w *World) unequipItem(p *Player, query string) bool {
+	args := strings.Fields(strings.TrimSpace(strings.ToLower(query)))
+	if len(args) == 0 {
+		p.Send <- "Usage: unequip <item|left|right>"
+		return false
+	}
+
+	if len(args) == 1 {
+		if hand, ok := parseHand(args[0]); ok {
+			return w.unequipHand(p, hand)
+		}
+		return w.unequipByItem(p, args[0])
+	}
+
+	item, hand, ok := findEquippedItem(p, strings.Join(args, " "))
+	if !ok {
+		if h, handOK := parseHand(args[len(args)-1]); handOK {
+			itemName := strings.Join(args[:len(args)-1], " ")
+			item, hand, ok = findEquippedItemInHand(p, itemName, h)
+		}
+	}
+	if !ok {
+		p.Send <- "You aren't wielding that."
+		return false
+	}
+
+	return w.unequipHandItem(p, hand, item)
+}
+
+func (w *World) unequipByItem(p *Player, query string) bool {
+	item, hand, ok := findEquippedItem(p, query)
+	if !ok {
+		p.Send <- "You aren't wielding that."
+		return false
+	}
+	if other := handItem(p, otherHand(hand)); other != nil {
+		if strings.Contains(strings.ToLower(other.Name), strings.ToLower(query)) ||
+			strings.Contains(strings.ToLower(query), strings.ToLower(other.Name)) {
+			p.Send <- "Which hand?"
+			return false
+		}
+	}
+	return w.unequipHandItem(p, hand, item)
+}
+
+func (w *World) unequipHand(p *Player, hand Hand) bool {
+	item := handItem(p, hand)
+	if item == nil {
+		p.Send <- "Your " + string(hand) + " hand is empty."
+		return false
+	}
+	return w.unequipHandItem(p, hand, item)
+}
+
+func (w *World) unequipHandItem(p *Player, hand Hand, item *Item) bool {
+	clearHand(p, hand)
+	p.Inventory = append(p.Inventory, item)
+	p.Send <- "You unequip the " + item.Name + " from your " + string(hand) + " hand."
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" unequips a "+item.Name+".", p)
+	return true
+}
+
+func handItem(p *Player, hand Hand) *Item {
+	if hand == HandLeft {
+		return p.LeftHand
+	}
+	return p.RightHand
+}
+
+func setHand(p *Player, hand Hand, item *Item) {
+	if hand == HandLeft {
+		p.LeftHand = item
+		return
+	}
+	p.RightHand = item
+}
+
+func clearHand(p *Player, hand Hand) {
+	setHand(p, hand, nil)
+}
+
+func otherHand(hand Hand) Hand {
+	if hand == HandLeft {
+		return HandRight
+	}
+	return HandLeft
+}
+
+func parseHand(word string) (Hand, bool) {
+	switch strings.ToLower(word) {
+	case "right", "r":
+		return HandRight, true
+	case "left", "l":
+		return HandLeft, true
+	default:
+		return "", false
+	}
+}
+
+func findEquippedItem(p *Player, query string) (*Item, Hand, bool) {
+	if item, hand, ok := findEquippedItemInHand(p, query, HandRight); ok {
+		return item, hand, true
+	}
+	return findEquippedItemInHand(p, query, HandLeft)
+}
+
+func findEquippedItemInHand(p *Player, query string, hand Hand) (*Item, Hand, bool) {
+	item := handItem(p, hand)
+	if item == nil {
+		return nil, "", false
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	name := strings.ToLower(item.Name)
+	if name == query || strings.Contains(name, query) {
+		return item, hand, true
+	}
+	return nil, "", false
+}
+
+func isSwordQuery(query string) bool {
+	return query == "sword" || strings.Contains(query, "sword")
+}
+
+func roomHasSword(room *Room) bool {
+	for _, item := range room.Items {
+		if item.Kind == ItemWeapon {
+			return true
+		}
+	}
+	return false
 }
 
 var (
