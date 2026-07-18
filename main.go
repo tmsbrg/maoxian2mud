@@ -6,6 +6,8 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -108,6 +110,7 @@ type Player struct {
 
 type Mob struct {
 	Name          string
+	Number        int
 	Room          *Room
 	HP            int
 	MaxHP         int
@@ -127,6 +130,7 @@ type World struct {
 	Rooms          []*Room
 	RatsNest       *Room
 	NextRatSpawnAt time.Time
+	NextRatNumber  int
 	StartRoom      *Room
 }
 
@@ -259,14 +263,11 @@ func NewWorld() *World {
 	linkRooms(echoingCavern, East, rootCrackedCavern)
 	linkRooms(ratsNest, West, rootCrackedCavern)
 
-	rat := newRat(ratsNest)
-
 	world := &World{
 		Join:      make(chan *Player),
 		Leave:     make(chan *Player),
 		Command:   make(chan Command),
 		Players:   make(map[*Player]bool),
-		Mobs:      []*Mob{rat},
 		Rooms: []*Room{
 			palace, square, sewerIntersection, northSewerTunnel, undergroundTemple,
 			eastSewerTunnel, treasureRoom, southSewerTunnel, ratsNest, westSewerTunnel,
@@ -276,6 +277,10 @@ func NewWorld() *World {
 		RatsNest:  ratsNest,
 		StartRoom: palace,
 	}
+
+	rat := world.newRat(ratsNest)
+
+	world.Mobs = []*Mob{rat}
 	world.scheduleNextRatSpawn()
 	return world
 }
@@ -310,7 +315,6 @@ func (w *World) Run() {
 			p.LeftHand = nil
 			p.HP = playerMaxHP
 			p.MaxHP = playerMaxHP
-			p.LastRegenAt = time.Now()
 			p.TookRackSword = false
 			p.Send <- "Welcome to MaoXianMUD!"
 			p.Send <- "Type 'help'"
@@ -371,10 +375,15 @@ func (w *World) describeRoom(p *Player) string {
 	}
 
 	if creatures := w.creaturesInRoom(room); len(creatures) > 0 {
+		sort.Slice(creatures, func(i, j int) bool {
+			return creatures[i].Number < creatures[j].Number
+		})
 		b.WriteString("\nCreatures:\n")
 		for _, mob := range creatures {
 			b.WriteString("  ")
-			b.WriteString(mob.Name)
+			b.WriteString(mobLabel(mob))
+			b.WriteString(", ")
+			b.WriteString(woundDescription(mob.HP, mob.MaxHP))
 			b.WriteString("\n")
 		}
 	}
@@ -575,10 +584,7 @@ func (w *World) examine(p *Player, query string) {
 		return
 	}
 
-	if mob, err := findMobInRoom(w, p.Room, query); err == errItemAmbiguous {
-		p.Send <- "Which one?"
-		return
-	} else if err == nil {
+	if mob, err := findMobInRoom(w, p.Room, query); err == nil {
 		p.Send <- describeMob(mob)
 		return
 	}
@@ -1074,34 +1080,94 @@ func (w *World) playersInRoom(room *Room) []*Player {
 	return players
 }
 
+func mobLabel(mob *Mob) string {
+	return fmt.Sprintf("%s %d", mob.Name, mob.Number)
+}
+
 func findMobInRoom(w *World, room *Room, query string) (*Mob, error) {
 	query = strings.ToLower(strings.TrimSpace(query))
+	mobs := w.creaturesInRoom(room)
+	if len(mobs) == 0 {
+		return nil, errItemNotFound
+	}
 
-	var match *Mob
-	matches := 0
-	for _, mob := range w.Mobs {
-		if !mob.Alive || mob.Room != room {
-			continue
+	args := strings.Fields(query)
+	if len(args) == 2 && args[0] == "rat" {
+		if n, err := strconv.Atoi(args[1]); err == nil {
+			if mob := mobByNumber(mobs, n); mob != nil {
+				return mob, nil
+			}
+			return nil, errItemNotFound
 		}
-		name := strings.ToLower(mob.Name)
-		if name == query || strings.Contains(name, query) {
-			matches++
-			match = mob
+	}
+	if len(args) == 1 {
+		if n, err := strconv.Atoi(args[0]); err == nil {
+			if mob := mobByNumber(mobs, n); mob != nil {
+				return mob, nil
+			}
 		}
 	}
 
-	switch matches {
+	if query == "rat" {
+		if mob := mostInjuredMob(mobs); mob != nil {
+			return mob, nil
+		}
+	}
+
+	for _, mob := range mobs {
+		if strings.ToLower(mobLabel(mob)) == query {
+			return mob, nil
+		}
+	}
+
+	var matches []*Mob
+	for _, mob := range mobs {
+		label := strings.ToLower(mobLabel(mob))
+		if strings.Contains(label, query) {
+			matches = append(matches, mob)
+		}
+	}
+
+	switch len(matches) {
 	case 0:
 		return nil, errItemNotFound
 	case 1:
-		return match, nil
+		return matches[0], nil
 	default:
+		if mob := mostInjuredMob(matches); mob != nil {
+			return mob, nil
+		}
 		return nil, errItemAmbiguous
 	}
 }
 
+func mobByNumber(mobs []*Mob, n int) *Mob {
+	for _, mob := range mobs {
+		if mob.Number == n {
+			return mob
+		}
+	}
+	return nil
+}
+
+func mostInjuredMob(mobs []*Mob) *Mob {
+	if len(mobs) == 0 {
+		return nil
+	}
+	best := mobs[0]
+	bestPct := float64(best.HP) / float64(best.MaxHP)
+	for _, mob := range mobs[1:] {
+		pct := float64(mob.HP) / float64(mob.MaxHP)
+		if pct < bestPct || (pct == bestPct && mob.HP < best.HP) {
+			best = mob
+			bestPct = pct
+		}
+	}
+	return best
+}
+
 func describeMob(mob *Mob) string {
-	return "A vicious sewer " + mob.Name + ". It looks " + woundDescription(mob.HP, mob.MaxHP) + "."
+	return mobLabel(mob) + ": a vicious sewer rat. It looks " + woundDescription(mob.HP, mob.MaxHP) + "."
 }
 
 func parseAttackArgs(query string) (target string, hand Hand, ok bool) {
@@ -1131,10 +1197,6 @@ func (w *World) attack(p *Player, query string) bool {
 		p.Send <- "You don't see that here."
 		return false
 	}
-	if err == errItemAmbiguous {
-		p.Send <- "Which one?"
-		return false
-	}
 
 	weapon := handItem(p, hand)
 	minD, maxD := handDamage(weapon)
@@ -1144,13 +1206,14 @@ func (w *World) attack(p *Player, query string) bool {
 		mob.HP = 0
 	}
 
+	label := mobLabel(mob)
 	attackDesc := "bare fists"
 	if weapon != nil {
 		attackDesc = "your " + weapon.Name
 	}
 
-	p.Send <- fmt.Sprintf("You attack the %s with %s for %d damage!", mob.Name, attackDesc, damage)
-	w.broadcastToRoom(p.Room, "*** "+p.Name+" attacks the "+mob.Name+" for "+fmt.Sprintf("%d", damage)+" damage!", p)
+	p.Send <- fmt.Sprintf("You attack %s with %s for %d damage!", label, attackDesc, damage)
+	w.broadcastToRoom(p.Room, "*** "+p.Name+" attacks "+label+" for "+fmt.Sprintf("%d", damage)+" damage!", p)
 	p.Room.Items = append(p.Room.Items, newBloodSpatter())
 
 	if mob.HP <= 0 {
@@ -1158,14 +1221,14 @@ func (w *World) attack(p *Player, query string) bool {
 		return true
 	}
 
-	p.Send <- "The " + mob.Name + " looks " + woundDescription(mob.HP, mob.MaxHP) + "."
+	p.Send <- label + " looks " + woundDescription(mob.HP, mob.MaxHP) + "."
 	return true
 }
 
 func (w *World) killMob(mob *Mob, room *Room) {
 	mob.Alive = false
 	room.Items = append(room.Items, newRatCorpse(), newBloodPool())
-	w.broadcastToRoom(room, "*** The "+mob.Name+" dies!", nil)
+	w.broadcastToRoom(room, "*** "+mobLabel(mob)+" dies!", nil)
 	w.scheduleNextRatSpawn()
 }
 
@@ -1186,9 +1249,11 @@ func (w *World) mobCombatTick() {
 		if target.HP < 0 {
 			target.HP = 0
 		}
+		target.LastRegenAt = time.Now()
 
-		target.Send <- fmt.Sprintf("The %s bites you for %d damage! (%d/%d HP)", mob.Name, damage, target.HP, target.MaxHP)
-		w.broadcastToRoom(mob.Room, "The "+mob.Name+" bites "+target.Name+"!", target)
+		label := mobLabel(mob)
+		target.Send <- fmt.Sprintf("The %s bites you for %d damage! (%d/%d HP)", label, damage, target.HP, target.MaxHP)
+		w.broadcastToRoom(mob.Room, "The "+label+" bites "+target.Name+"!", target)
 	}
 }
 
@@ -1240,11 +1305,11 @@ func (w *World) moveMob(mob *Mob) {
 }
 
 func (w *World) announceMobLeave(room *Room, mob *Mob, dir Direction) {
-	w.broadcastToRoom(room, "A "+mob.Name+" scurries "+string(dir)+".", nil)
+	w.broadcastToRoom(room, "A "+mobLabel(mob)+" scurries "+string(dir)+".", nil)
 }
 
 func (w *World) announceMobEnter(room *Room, mob *Mob, dir Direction) {
-	w.broadcastToRoom(room, "A "+mob.Name+" scurries in from the "+string(opposite[dir])+".", nil)
+	w.broadcastToRoom(room, "A "+mobLabel(mob)+" scurries in from the "+string(opposite[dir])+".", nil)
 }
 
 func (w *World) ratSpawnTick() {
@@ -1262,8 +1327,8 @@ func (w *World) ratSpawnTick() {
 		return
 	}
 
-	w.Mobs = append(w.Mobs, newRat(w.RatsNest))
-	w.broadcastToRoom(w.RatsNest, "A rat emerges from the refuse!", nil)
+	w.Mobs = append(w.Mobs, w.newRat(w.RatsNest))
+	w.broadcastToRoom(w.RatsNest, "A "+mobLabel(w.Mobs[len(w.Mobs)-1])+" emerges from the refuse!", nil)
 	w.scheduleNextRatSpawn()
 }
 
@@ -1308,7 +1373,6 @@ func (w *World) playerRegenTick() {
 			continue
 		}
 		if p.LastRegenAt.IsZero() {
-			p.LastRegenAt = now
 			continue
 		}
 		if now.Sub(p.LastRegenAt) < playerRegenPeriod {
@@ -1321,9 +1385,11 @@ func (w *World) playerRegenTick() {
 	}
 }
 
-func newRat(room *Room) *Mob {
+func (w *World) newRat(room *Room) *Mob {
+	w.NextRatNumber++
 	return &Mob{
 		Name:       "rat",
+		Number:     w.NextRatNumber,
 		Room:       room,
 		HP:         10,
 		MaxHP:      10,
