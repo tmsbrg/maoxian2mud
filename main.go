@@ -2,9 +2,11 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -30,6 +32,7 @@ var (
 		Up:    Down,
 		Down:  Up,
 	}
+	actionCooldown = 5 * time.Second
 )
 
 type Command struct {
@@ -49,10 +52,11 @@ type Item struct {
 }
 
 type Player struct {
-	Name      string
-	Room      *Room
-	Inventory []*Item
-	Send      chan string
+	Name       string
+	Room       *Room
+	Inventory  []*Item
+	LastAction time.Time
+	Send       chan string
 }
 
 type World struct {
@@ -204,6 +208,15 @@ func (w *World) handleCommand(cmd Command) {
 		return
 	}
 
+	if remaining := actionCooldown - time.Since(cmd.Player.LastAction); remaining > 0 {
+		sendCooldown(cmd.Player, remaining)
+		cmd.Player.Send <- fmt.Sprintf("You need to wait %.1f seconds.", remaining.Seconds())
+		return
+	}
+
+	cmd.Player.LastAction = time.Now()
+	sendCooldown(cmd.Player, actionCooldown)
+
 	parts := strings.SplitN(line, " ", 2)
 
 	switch strings.ToLower(parts[0]) {
@@ -349,6 +362,14 @@ func findItem(items []*Item, query string) (*Item, int, error) {
 
 func removeItemAt(items []*Item, i int) []*Item {
 	return append(items[:i], items[i+1:]...)
+}
+
+func sendCooldown(p *Player, d time.Duration) {
+	ms := d.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	p.Send <- fmt.Sprintf("@@cooldown:%d", ms)
 }
 
 func playerName(raw string) string {

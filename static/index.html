@@ -40,14 +40,54 @@ body {
     padding-bottom: max(8px, env(safe-area-inset-bottom));
 }
 
-#input {
+#input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#cooldown {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+#cooldown.active {
+    opacity: 1;
+}
+
+#cooldown svg {
     display: block;
+    width: 100%;
+    height: 100%;
+    transform: rotate(-90deg);
+}
+
+#cooldown-bg {
+    fill: none;
+    stroke: #004400;
+    stroke-width: 3;
+}
+
+#cooldown-fg {
+    fill: none;
+    stroke: #00ff00;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-dasharray: 100.53;
+    stroke-dashoffset: 0;
+}
+
+#input {
+    flex: 1;
+    min-width: 0;
     box-sizing: border-box;
     background: black;
     color: #00ff00;
     border: 2px solid #00aa00;
     border-radius: 4px;
-    width: 100%;
     margin: 0;
     padding: 12px 10px;
     font-family: monospace;
@@ -63,6 +103,11 @@ body {
 #input::placeholder {
     color: #008800;
 }
+
+#input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
 </style>
 </head>
 
@@ -71,16 +116,31 @@ body {
 <div id="output"></div>
 
 <div id="input-bar">
+<div id="input-row">
+<div id="cooldown" aria-hidden="true">
+<svg viewBox="0 0 36 36">
+<circle id="cooldown-bg" cx="18" cy="18" r="16"/>
+<circle id="cooldown-fg" cx="18" cy="18" r="16"/>
+</svg>
+</div>
 <input
     id="input"
     autocomplete="off"
     placeholder="Type command and press Enter"
 />
 </div>
+</div>
 
 <script>
 const output = document.getElementById("output");
 const input = document.getElementById("input");
+const cooldown = document.getElementById("cooldown");
+const cooldownFg = document.getElementById("cooldown-fg");
+
+const COOLDOWN_MS = 5000;
+const RING_LENGTH = 100.53;
+let cooldownEnd = 0;
+let cooldownFrame = null;
 
 const name = new URLSearchParams(location.search).get("name");
 const wsQuery = name ? `?name=${encodeURIComponent(name)}` : "";
@@ -93,8 +153,45 @@ function print(text) {
     output.scrollTop = output.scrollHeight;
 }
 
+function startCooldown(ms) {
+    cooldownEnd = Date.now() + ms;
+    input.disabled = true;
+    cooldown.classList.add("active");
+    updateCooldownRing();
+}
+
+function updateCooldownRing() {
+    const remaining = cooldownEnd - Date.now();
+
+    if (remaining <= 0) {
+        cooldownEnd = 0;
+        input.disabled = false;
+        cooldown.classList.remove("active");
+        cooldownFg.style.strokeDashoffset = "0";
+        cooldownFrame = null;
+        return;
+    }
+
+    const progress = remaining / COOLDOWN_MS;
+    cooldownFg.style.strokeDashoffset = String(RING_LENGTH * (1 - progress));
+    cooldownFrame = requestAnimationFrame(updateCooldownRing);
+}
+
 ws.onmessage = (event) => {
-    print(event.data);
+    const data = event.data;
+
+    if (data.startsWith("@@cooldown:")) {
+        const ms = Number(data.slice("@@cooldown:".length));
+        if (ms > 0) {
+            if (cooldownFrame) {
+                cancelAnimationFrame(cooldownFrame);
+            }
+            startCooldown(ms);
+        }
+        return;
+    }
+
+    print(data);
 };
 
 input.addEventListener("keydown", (e) => {
@@ -103,7 +200,14 @@ input.addEventListener("keydown", (e) => {
         return;
     }
 
-    const cmd = input.value;
+    if (Date.now() < cooldownEnd) {
+        return;
+    }
+
+    const cmd = input.value.trim();
+    if (!cmd) {
+        return;
+    }
 
     print("> " + cmd);
 
