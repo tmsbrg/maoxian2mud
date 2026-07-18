@@ -36,8 +36,19 @@ var (
 	actionCooldown   = 5 * time.Second
 	mobAttackPeriod  = 5 * time.Second
 	playerMaxHP      = 20
+	playerRegenPeriod = 1 * time.Minute
 	unarmedMinDamage = 1
 	unarmedMaxDamage = 3
+
+	bloodSpatterLifetime = 1 * time.Minute
+	bloodPoolToSpatter   = 1 * time.Minute
+	ratCorpseToSkeleton  = 1 * time.Minute
+	ratSkeletonLifetime  = 5 * time.Minute
+
+	maxRats         = 10
+	ratSpawnBaseSec = 30
+	ratRoamMinSec   = 5
+	ratRoamMaxSec   = 15
 )
 
 type Command struct {
@@ -55,9 +66,13 @@ type Room struct {
 type ItemKind string
 
 const (
-	ItemGeneric    ItemKind = ""
-	ItemWeapon     ItemKind = "weapon"
-	ItemWeaponRack ItemKind = "weapon_rack"
+	ItemGeneric      ItemKind = ""
+	ItemWeapon       ItemKind = "weapon"
+	ItemWeaponRack   ItemKind = "weapon_rack"
+	ItemBloodSpatter ItemKind = "blood_spatter"
+	ItemBloodPool    ItemKind = "blood_pool"
+	ItemRatCorpse    ItemKind = "rat_corpse"
+	ItemRatSkeleton  ItemKind = "rat_skeleton"
 )
 
 type Item struct {
@@ -67,6 +82,7 @@ type Item struct {
 	Fixed       bool
 	MinDamage   int
 	MaxDamage   int
+	CreatedAt   time.Time
 }
 
 type Hand string
@@ -84,28 +100,34 @@ type Player struct {
 	LeftHand      *Item
 	HP            int
 	MaxHP         int
+	LastRegenAt   time.Time
 	TookRackSword bool
 	LastAction    time.Time
 	Send          chan string
 }
 
 type Mob struct {
-	Name      string
-	Room      *Room
-	HP        int
-	MaxHP     int
-	Alive     bool
-	AttackMin int
-	AttackMax int
+	Name          string
+	Room          *Room
+	HP            int
+	MaxHP         int
+	Alive         bool
+	AttackMin     int
+	AttackMax     int
+	LastDirection Direction
+	NextRoamAt    time.Time
 }
 
 type World struct {
-	Join      chan *Player
-	Leave     chan *Player
-	Command   chan Command
-	Players   map[*Player]bool
-	Mobs      []*Mob
-	StartRoom *Room
+	Join           chan *Player
+	Leave          chan *Player
+	Command        chan Command
+	Players        map[*Player]bool
+	Mobs           []*Mob
+	Rooms          []*Room
+	RatsNest       *Room
+	NextRatSpawnAt time.Time
+	StartRoom      *Room
 }
 
 func NewWorld() *World {
@@ -237,24 +259,25 @@ func NewWorld() *World {
 	linkRooms(echoingCavern, East, rootCrackedCavern)
 	linkRooms(ratsNest, West, rootCrackedCavern)
 
-	rat := &Mob{
-		Name:      "rat",
-		Room:      ratsNest,
-		HP:        10,
-		MaxHP:     10,
-		Alive:     true,
-		AttackMin: 1,
-		AttackMax: 3,
-	}
+	rat := newRat(ratsNest)
 
-	return &World{
+	world := &World{
 		Join:      make(chan *Player),
 		Leave:     make(chan *Player),
 		Command:   make(chan Command),
 		Players:   make(map[*Player]bool),
 		Mobs:      []*Mob{rat},
+		Rooms: []*Room{
+			palace, square, sewerIntersection, northSewerTunnel, undergroundTemple,
+			eastSewerTunnel, treasureRoom, southSewerTunnel, ratsNest, westSewerTunnel,
+			dampSewerTunnel, naturalCave, ancientSecretPassage, crackedSewerPipe,
+			lowCavern, echoingCavern, rootCrackedCavern,
+		},
+		RatsNest:  ratsNest,
 		StartRoom: palace,
 	}
+	world.scheduleNextRatSpawn()
+	return world
 }
 
 func linkRooms(from *Room, dir Direction, to *Room) {
@@ -287,6 +310,7 @@ func (w *World) Run() {
 			p.LeftHand = nil
 			p.HP = playerMaxHP
 			p.MaxHP = playerMaxHP
+			p.LastRegenAt = time.Now()
 			p.TookRackSword = false
 			p.Send <- "Welcome to MaoXianMUD!"
 			p.Send <- "Type 'help'"
@@ -305,6 +329,10 @@ func (w *World) Run() {
 
 		case <-mobTicker.C:
 			w.mobCombatTick()
+			w.mobRoamTick()
+			w.ratSpawnTick()
+			w.playerRegenTick()
+			w.itemDecayTick()
 		}
 	}
 }
@@ -362,10 +390,8 @@ func (w *World) describeRoom(p *Player) string {
 				b.WriteString(wielding)
 				b.WriteString(")")
 			}
-			if other != p {
-				b.WriteString(", ")
-				b.WriteString(woundDescription(other.HP, other.MaxHP))
-			}
+			b.WriteString(", ")
+			b.WriteString(woundDescription(other.HP, other.MaxHP))
 			b.WriteString("\n")
 			hasPlayers = true
 		}
@@ -694,6 +720,10 @@ func (w *World) takeItem(p *Player, query string) bool {
 		p.Send <- "You can't take that."
 		return false
 	}
+	if item.Kind == ItemBloodSpatter || item.Kind == ItemBloodPool {
+		p.Send <- "You can't take that."
+		return false
+	}
 
 	p.Room.Items = removeItemAt(p.Room.Items, idx)
 	w.giveTakenItem(p, item)
@@ -961,26 +991,29 @@ var (
 func findItem(items []*Item, query string) (*Item, int, error) {
 	query = strings.ToLower(strings.TrimSpace(query))
 
-	var match *Item
-	var matchIdx int
-	matches := 0
-
+	var indices []int
 	for i, item := range items {
 		name := strings.ToLower(item.Name)
 		if name == query || strings.Contains(name, query) {
-			matches++
-			match = item
-			matchIdx = i
+			indices = append(indices, i)
 		}
 	}
 
-	switch matches {
+	switch len(indices) {
 	case 0:
 		return nil, -1, errItemNotFound
 	case 1:
-		return match, matchIdx, nil
+		i := indices[0]
+		return items[i], i, nil
 	default:
-		return nil, -1, errItemAmbiguous
+		firstName := strings.ToLower(items[indices[0]].Name)
+		for _, i := range indices[1:] {
+			if strings.ToLower(items[i].Name) != firstName {
+				return nil, -1, errItemAmbiguous
+			}
+		}
+		i := indices[0]
+		return items[i], i, nil
 	}
 }
 
@@ -1133,6 +1166,7 @@ func (w *World) killMob(mob *Mob, room *Room) {
 	mob.Alive = false
 	room.Items = append(room.Items, newRatCorpse(), newBloodPool())
 	w.broadcastToRoom(room, "*** The "+mob.Name+" dies!", nil)
+	w.scheduleNextRatSpawn()
 }
 
 func (w *World) mobCombatTick() {
@@ -1158,10 +1192,197 @@ func (w *World) mobCombatTick() {
 	}
 }
 
+func (w *World) mobRoamTick() {
+	now := time.Now()
+	for _, mob := range w.Mobs {
+		if !mob.Alive {
+			continue
+		}
+		if len(w.playersInRoom(mob.Room)) > 0 {
+			continue
+		}
+		if mob.NextRoamAt.IsZero() {
+			mob.NextRoamAt = now.Add(randomRoamDelay())
+			continue
+		}
+		if now.Before(mob.NextRoamAt) {
+			continue
+		}
+
+		w.moveMob(mob)
+		mob.NextRoamAt = now.Add(randomRoamDelay())
+	}
+}
+
+func (w *World) moveMob(mob *Mob) {
+	var options []Direction
+	for dir := range mob.Room.Exits {
+		if dir == Up || dir == Down {
+			continue
+		}
+		if mob.LastDirection != "" && dir == opposite[mob.LastDirection] {
+			continue
+		}
+		options = append(options, dir)
+	}
+	if len(options) == 0 {
+		return
+	}
+
+	dir := options[rand.Intn(len(options))]
+	dest := mob.Room.Exits[dir]
+	oldRoom := mob.Room
+
+	w.announceMobLeave(oldRoom, mob, dir)
+	mob.Room = dest
+	mob.LastDirection = dir
+	w.announceMobEnter(dest, mob, dir)
+}
+
+func (w *World) announceMobLeave(room *Room, mob *Mob, dir Direction) {
+	w.broadcastToRoom(room, "A "+mob.Name+" scurries "+string(dir)+".", nil)
+}
+
+func (w *World) announceMobEnter(room *Room, mob *Mob, dir Direction) {
+	w.broadcastToRoom(room, "A "+mob.Name+" scurries in from the "+string(opposite[dir])+".", nil)
+}
+
+func (w *World) ratSpawnTick() {
+	if w.RatsNest == nil {
+		return
+	}
+	if w.aliveRatCount() >= maxRats {
+		return
+	}
+	if w.NextRatSpawnAt.IsZero() {
+		w.scheduleNextRatSpawn()
+		return
+	}
+	if time.Now().Before(w.NextRatSpawnAt) {
+		return
+	}
+
+	w.Mobs = append(w.Mobs, newRat(w.RatsNest))
+	w.broadcastToRoom(w.RatsNest, "A rat emerges from the refuse!", nil)
+	w.scheduleNextRatSpawn()
+}
+
+func (w *World) aliveRatCount() int {
+	count := 0
+	for _, mob := range w.Mobs {
+		if mob.Alive {
+			count++
+		}
+	}
+	return count
+}
+
+func (w *World) scheduleNextRatSpawn() {
+	count := w.aliveRatCount()
+	if count >= maxRats {
+		w.NextRatSpawnAt = time.Time{}
+		return
+	}
+	w.NextRatSpawnAt = time.Now().Add(ratSpawnDelay(count))
+}
+
+func ratSpawnDelay(activeRats int) time.Duration {
+	base := time.Duration(ratSpawnBaseSec*(activeRats+1)) * time.Second
+	jitter := time.Duration(rand.Intn(21)-10) * time.Second
+	delay := base + jitter
+	if delay < 10*time.Second {
+		delay = 10 * time.Second
+	}
+	return delay
+}
+
+func randomRoamDelay() time.Duration {
+	sec := ratRoamMinSec + rand.Intn(ratRoamMaxSec-ratRoamMinSec+1)
+	return time.Duration(sec) * time.Second
+}
+
+func (w *World) playerRegenTick() {
+	now := time.Now()
+	for p := range w.Players {
+		if p.HP <= 0 || p.HP >= p.MaxHP {
+			continue
+		}
+		if p.LastRegenAt.IsZero() {
+			p.LastRegenAt = now
+			continue
+		}
+		if now.Sub(p.LastRegenAt) < playerRegenPeriod {
+			continue
+		}
+
+		p.HP++
+		p.LastRegenAt = now
+		p.Send <- fmt.Sprintf("You feel a little better. (%d/%d HP)", p.HP, p.MaxHP)
+	}
+}
+
+func newRat(room *Room) *Mob {
+	return &Mob{
+		Name:       "rat",
+		Room:       room,
+		HP:         10,
+		MaxHP:      10,
+		Alive:      true,
+		AttackMin:  1,
+		AttackMax:  3,
+		NextRoamAt: time.Now().Add(randomRoamDelay()),
+	}
+}
+
+func (w *World) itemDecayTick() {
+	now := time.Now()
+	for _, room := range w.Rooms {
+		var kept []*Item
+		for _, item := range room.Items {
+			if item.CreatedAt.IsZero() {
+				kept = append(kept, item)
+				continue
+			}
+
+			age := now.Sub(item.CreatedAt)
+			switch item.Kind {
+			case ItemBloodSpatter:
+				if age >= bloodSpatterLifetime {
+					continue
+				}
+				kept = append(kept, item)
+			case ItemBloodPool:
+				if age >= bloodPoolToSpatter {
+					kept = append(kept, newBloodSpatter())
+					continue
+				}
+				kept = append(kept, item)
+			case ItemRatCorpse:
+				if age >= ratCorpseToSkeleton {
+					kept = append(kept, newRatSkeleton())
+					continue
+				}
+				kept = append(kept, item)
+			case ItemRatSkeleton:
+				if age >= ratSkeletonLifetime {
+					continue
+				}
+				kept = append(kept, item)
+			default:
+				kept = append(kept, item)
+			}
+		}
+		room.Items = kept
+	}
+}
+
 func newBloodSpatter() *Item {
 	return &Item{
 		Name:        "blood spatter",
 		Description: "Fresh blood marks the floor.",
+		Kind:        ItemBloodSpatter,
+		Fixed:       true,
+		CreatedAt:   time.Now(),
 	}
 }
 
@@ -1169,6 +1390,9 @@ func newBloodPool() *Item {
 	return &Item{
 		Name:        "blood pool",
 		Description: "Blood has pooled on the ground.",
+		Kind:        ItemBloodPool,
+		Fixed:       true,
+		CreatedAt:   time.Now(),
 	}
 }
 
@@ -1176,6 +1400,17 @@ func newRatCorpse() *Item {
 	return &Item{
 		Name:        "rat corpse",
 		Description: "The body of a large rat.",
+		Kind:        ItemRatCorpse,
+		CreatedAt:   time.Now(),
+	}
+}
+
+func newRatSkeleton() *Item {
+	return &Item{
+		Name:        "rat skeleton",
+		Description: "A rat skeleton, picked clean.",
+		Kind:        ItemRatSkeleton,
+		CreatedAt:   time.Now(),
 	}
 }
 
